@@ -9,7 +9,7 @@ Tabpak turns a [Songsterr](https://www.songsterr.com) tab into a song you can pl
 - **Every guitar and bass part** of the tab, with its tuning, capo, bends, slides, hammer-ons, palm mutes, harmonics and chords, as a [feedpak](https://github.com/got-feedback/feedpak-spec) file.
 - **Three kinds of sound**, your pick per song:
   - **Recording**: the real recording, from the YouTube video Songsterr synced to the tab measure by measure. Notes land where the band plays them. A private or removed video is skipped and the next synced one is used.
-  - **Songsterr sound**: Songsterr's own playback. Each part you pick gets its own track, next to "Rest of the band" and a full mix, so quickRS's mixer can mute your part while you play it.
+  - **Songsterr sound**: Songsterr's own playback. Each part you pick gets its own track, next to "Rest of the band" and a full mix, so quickRS's mixer can mute your part while you play it. The notes follow the tab's own tempo the way Songsterr's player does: tempo changes, swing, fermatas, grace notes, pickup measures and repeats. After each conversion Tabpak checks every part's notes against its sound and tells you when they are out of step.
   - **My file**: your own audio file, with the notes placed by Songsterr's sync for the song's video. A field shifts the notes when your file starts earlier or later.
 - **A look at each part before you convert**: tuning, note count, and a strip that shows where in the song the part plays.
 - **Your songs in one list**, with a key that opens quickRS.
@@ -77,10 +77,10 @@ tabpak convert https://www.songsterr.com/a/wsa/metallica-master-of-puppets-tab-s
 | Path | What it holds |
 | --- | --- |
 | `src/songsterr.rs` | Songsterr's pages and files: search, a song's parts, tab data, synced videos. |
-| `src/chart.rs` | Tab to chart: repeats unrolled, notes and techniques, measure times from the sync points. |
+| `src/chart.rs` | Tab to chart: repeats unrolled, notes and techniques, note times from the tab's tempo as Songsterr's player counts them, measure times from the sync points. |
 | `src/audio.rs` | Sound in and out: yt-dlp download, decoding (AAC, Opus, MP3, FLAC, WAV, Ogg), mixing, Ogg Vorbis encoding, covers. |
 | `src/feedpak.rs` | The feedpak file: manifest, zip, and reading back the songs already made. |
-| `src/convert.rs` | One conversion from start to end, and quickRS's song folders. |
+| `src/convert.rs` | One conversion from start to end, the check of notes against Songsterr's sound, and quickRS's song folders. |
 | `src/ui.rs` | The window. |
 | `src/cli.rs` | The terminal commands. |
 | `examples/shots.rs` | Draws every state of the window to PNG files without opening a window. |

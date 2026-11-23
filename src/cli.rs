@@ -97,6 +97,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 eprintln!("  {name}: {count} notes and chords");
             }
             eprintln!("  audio: {}, {}; {} sync points for {} measures", done.audio, clock(done.seconds), done.points, done.measures);
+            if let Some((hits, places)) = done.in_step {
+                eprintln!("  sync check: notes line up with the sound at {hits} of {places} places");
+            }
             for note in &done.notes {
                 eprintln!("  {note}");
             }

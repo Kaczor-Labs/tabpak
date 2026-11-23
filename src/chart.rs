@@ -42,9 +42,8 @@ impl Frac {
         Frac::new(self.n * o.d - o.n * self.d, self.d * o.d)
     }
 
-    fn over(self, o: Frac) -> f64 {
-        let r = Frac::new(self.n * o.d, self.d * o.n);
-        r.n as f64 / r.d as f64
+    fn times(self, o: Frac) -> Frac {
+        Frac::new(self.n * o.n, self.d * o.d)
     }
 
     fn float(self) -> f64 {
@@ -55,9 +54,6 @@ impl Frac {
         self.n * o.d < o.n * self.d
     }
 
-    fn is_zero(self) -> bool {
-        self.n == 0
-    }
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -98,45 +94,115 @@ fn measures(track: &Value) -> &[Value] {
     track["measures"].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
 
-/// A voice's length without its grace notes, which take no time.
-fn voice_length(voice: &Value) -> Frac {
-    beats(voice)
+/// The time signature of every written measure: its own, else the one before it, else 4/4.
+fn signatures(track: &Value) -> Vec<[i64; 2]> {
+    let mut sig = [4i64, 4];
+    measures(track)
         .iter()
-        .filter(|b| !truthy(&b["graceNote"]))
-        .fold(Frac::ZERO, |sum, b| sum.plus(Frac::of(&b["duration"])))
+        .map(|m| {
+            if let (Some(n), Some(d)) = (m["signature"][0].as_i64(), m["signature"][1].as_i64())
+                && n > 0
+                && d > 0
+            {
+                sig = [n, d];
+            }
+            sig
+        })
+        .collect()
 }
 
-/// Measure indexes in the order they are played: repeats and numbered endings written out.
+fn endings_of(measure: &Value) -> Vec<i64> {
+    match &measure["alternateEnding"] {
+        Value::Number(n) => n.as_i64().into_iter().collect(),
+        Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// How many times a repeat sign plays its section; Songsterr's player stops counting at 32.
+fn plays(measure: &Value) -> i64 {
+    measure["repeat"].as_i64().unwrap_or(0).clamp(0, 32)
+}
+
+/// A repeated stretch of the tab: where it opens and closes, and the measure each numbered ending starts at.
+struct Section {
+    start: usize,
+    end: usize,
+    endings: HashMap<i64, usize>,
+}
+
+/// Measure indexes in the order they are played: repeats and numbered endings written out, by the rules of
+/// Songsterr's own player (a repeat sign with no opening sign repeats from the first measure).
 pub fn unroll(track: &Value) -> Vec<usize> {
     let ms = measures(track);
-    let (mut order, mut i, mut start, mut lap) = (Vec::new(), 0usize, 0usize, 1i64);
-    while i < ms.len() && order.len() < 20000 {
-        let m = &ms[i];
-        if truthy(&m["repeatStart"]) && i != start {
-            start = i;
-            lap = 1;
+    let mut sections: Vec<Section> = Vec::new();
+    let mut of: Vec<Option<usize>> = vec![None; ms.len()];
+    let mut open = false;
+    for (i, m) in ms.iter().enumerate() {
+        if truthy(&m["repeatStart"]) {
+            sections.push(Section { start: i, end: 0, endings: HashMap::new() });
+            open = true;
         }
-        let endings: Vec<i64> = match &m["alternateEnding"] {
-            Value::Number(n) => n.as_i64().into_iter().collect(),
-            Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(),
-            _ => Vec::new(),
-        };
-        if !endings.is_empty() && !endings.contains(&lap) {
+        let endings = endings_of(m);
+        if let Some(last) = sections.len().checked_sub(1)
+            && (open || !endings.is_empty())
+        {
+            of[i] = Some(last);
+            sections[last].endings.extend(endings.iter().map(|e| (*e, i)));
+        }
+        if plays(m) > 0 {
+            if sections.is_empty() {
+                sections.push(Section { start: 0, end: 0, endings: endings.iter().map(|e| (*e, i)).collect() });
+                of[..=i].fill(Some(0));
+            }
+            let last = sections.len() - 1;
+            sections[last].end = i;
+            open = false;
+        }
+    }
+
+    let (mut order, mut i) = (Vec::new(), 0usize);
+    // the section being played, which pass of it this is, and whether a numbered ending is under way
+    let (mut current, mut pass, mut in_ending) = (None::<usize>, 0i64, false);
+    while i < ms.len() && order.len() < 100_000 {
+        order.push(i);
+        if let Some(c) = of[i]
+            && sections[c].start == i
+            && current.is_none_or(|r| sections[r].start != i)
+            && sections[c].end >= sections[c].start
+        {
+            current = Some(c);
+            pass = 1;
+        }
+        let Some(section) = current.map(|r| &sections[r]) else {
             i += 1;
             continue;
-        }
-        order.push(i);
-        let times = m["repeat"].as_i64().unwrap_or(0);
-        if times > 1 {
-            if lap < times {
-                lap += 1;
-                i = start;
-                continue;
-            }
-            start = i + 1;
-            lap = 1;
+        };
+        if pass < plays(&ms[i]) {
+            i = section.start;
+            pass += 1;
+            in_ending = false;
+            continue;
         }
         i += 1;
+        if i < ms.len() {
+            let endings = endings_of(&ms[i]);
+            if endings.contains(&pass) {
+                in_ending = true;
+            } else if !endings.is_empty() && in_ending {
+                i = section.start;
+                pass += 1;
+                in_ending = false;
+            } else if !endings.is_empty() {
+                let own = section.endings.get(&pass).copied().filter(|at| *at != 0);
+                i = own.unwrap_or(if pass < plays(&ms[section.end]) { section.end } else { section.end + 1 });
+                in_ending = true;
+            }
+            if i > section.end {
+                current = None;
+                pass = 0;
+            }
+        }
     }
     order
 }
@@ -146,55 +212,533 @@ pub fn unroll(track: &Value) -> Vec<usize> {
 #[derive(Clone, Debug)]
 pub struct Slot {
     pub sig: [i64; 2],
-    pub length: Frac,
+    pub length: f64,
     pub seconds: f64,
     pub bpm: f64,
+    /// Where the tempo changes inside the measure: (how far into the measure, how far into its time), both
+    /// 0 to 1, from (0, 0) to (1, 1). Empty when the measure runs at one tempo.
+    pub warp: Vec<(f64, f64)>,
 }
 
-fn measure_length(measure: &Value, signature: Frac) -> Frac {
-    let longest = voices(measure)
+impl Slot {
+    /// How far into the measure's time a place in the measure is, both 0 to 1. A place before the measure or
+    /// past its end runs on at the tempo of the measure's nearest part.
+    pub fn time_at(&self, place: f64) -> f64 {
+        if self.warp.len() < 2 {
+            return place;
+        }
+        let last = self.warp.len() - 1;
+        let k = self.warp.iter().position(|(x, _)| *x >= place).unwrap_or(last).clamp(1, last);
+        let ((x0, y0), (x1, y1)) = (self.warp[k - 1], self.warp[k]);
+        if x1 > x0 { y0 + (y1 - y0) * (place - x0) / (x1 - x0) } else { y1 }
+    }
+}
+
+/// One tempo entry of the tab, as Songsterr's player carries it through its steps: `position` counts 960 to
+/// a quarter note from the start of `measure`, `bpm` counts notes of `unit` (4 a quarter, 2 a half, 8 an eighth).
+#[derive(Clone, Debug, PartialEq)]
+struct Tempo {
+    measure: i64,
+    position: f64,
+    bpm: f64,
+    unit: i64,
+    dotted: bool,
+    linear: bool,
+    /// For a fermata's slow stretch: how long it holds, in the units of `position`.
+    span: f64,
+}
+
+/// Position units (960 to a quarter note) are cut to this many steps a quarter note, as the player does.
+const STEPS_PER_QUARTER: f64 = 16384.0;
+
+/// Places in a measure are sums of thirds and fifths of notes: two that differ by less than this are the same place.
+const EDGE: f64 = 1e-9;
+
+/// JavaScript's rounding: a half goes up.
+fn round_half_up(x: f64) -> f64 {
+    (x + 0.5).floor()
+}
+
+impl Tempo {
+    fn of(v: &Value) -> Option<Tempo> {
+        Some(Tempo {
+            measure: v["measure"].as_i64().unwrap_or(0),
+            position: v["position"].as_f64().unwrap_or(0.0),
+            bpm: v["bpm"].as_f64()?,
+            unit: v["type"].as_i64().unwrap_or(4),
+            dotted: truthy(&v["dotted"]),
+            linear: truthy(&v["linear"]),
+            span: 0.0,
+        })
+    }
+
+    fn plain(measure: i64, position: f64, bpm: f64, unit: i64) -> Tempo {
+        Tempo { measure, position, bpm, unit, dotted: false, linear: false, span: 0.0 }
+    }
+
+    /// Quarter notes a minute, cut to a whole number.
+    fn quarter_bpm(&self) -> f64 {
+        let bpm = match self.unit {
+            8 => self.bpm / 2.0,
+            2 => self.bpm * 2.0,
+            _ => self.bpm,
+        };
+        (if self.dotted { bpm * 1.5 } else { bpm }).floor()
+    }
+}
+
+/// A measure's length in tempo position units.
+fn position_length(sig: [i64; 2]) -> f64 {
+    3840.0 * sig[0] as f64 / sig[1] as f64
+}
+
+fn by_place(a: &Tempo, b: &Tempo) -> std::cmp::Ordering {
+    a.measure.cmp(&b.measure).then(a.position.total_cmp(&b.position))
+}
+
+/// How long a fermata holds: the beat it stands on, or the smallest halving of the beat that it starts on.
+fn fermata_span(position: f64, sig: [i64; 2]) -> f64 {
+    let beat = position_length(sig) / sig[0] as f64;
+    let part = (position / beat).rem_euclid(1.0);
+    if part.abs() < 1e-9 {
+        return beat;
+    }
+    for halvings in 1..=7 {
+        let pieces = 2f64.powi(halvings);
+        if (part * pieces - (part * pieces).round()).abs() < 1e-9 {
+            return beat / pieces;
+        }
+    }
+    beat / 128.0
+}
+
+/// The tempo list with every fermata written in as a slow stretch and a return to the tempo after it.
+fn with_fermatas(tempo: Vec<Tempo>, track: &Value, sigs: &[[i64; 2]]) -> Vec<Tempo> {
+    // (measure, position, length 0 to 1)
+    let mut fermatas: Vec<(i64, f64, f64)> = track["automations"]["fermata"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
         .iter()
-        .map(voice_length)
-        .fold(Frac::ZERO, |a, b| if a.less(b) { b } else { a });
-    if longest.is_zero() { signature } else { longest }
+        .map(|f| (f["measure"].as_i64().unwrap_or(0), f["position"].as_f64().unwrap_or(0.0), f["length"].as_f64().unwrap_or(0.0)))
+        .collect();
+    if fermatas.is_empty() || tempo.is_empty() {
+        return tempo;
+    }
+    fermatas.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    fn put(out: &mut Vec<Tempo>, entry: Tempo) {
+        match out.iter_mut().find(|e| e.measure == entry.measure && e.position == entry.position) {
+            Some(same) => *same = entry,
+            None => out.push(entry),
+        }
+    }
+    let mut carried = tempo[0].clone();
+    let mut out: Vec<Tempo> = Vec::new();
+    for (t, &sig) in sigs.iter().enumerate() {
+        let t = t as i64;
+        let mut here: Vec<Tempo> = tempo.iter().filter(|e| e.measure == t).cloned().collect();
+        let first_here = here.first().cloned().unwrap_or_else(|| carried.clone());
+        here.sort_by(|a, b| a.position.total_cmp(&b.position));
+        if t == 0 && !here.iter().any(|e| e.position == 0.0) {
+            out.push(Tempo { measure: 0, position: 0.0, ..first_here.clone() });
+        }
+        out.extend(here.iter().cloned());
+        for &(_, at, length) in fermatas.iter().filter(|f| f.0 == t) {
+            let span = fermata_span(at, sig);
+            let end = at + span;
+            let before = here.iter().rev().find(|e| e.position <= at).unwrap_or(&carried);
+            let after = here.iter().rev().find(|e| e.position <= end).unwrap_or(&carried);
+            let slow = round_half_up(before.bpm * (-7.0 / 12.0 * (0.2 + length * 0.8) + 11.0 / 12.0));
+            put(&mut out, Tempo { span, ..Tempo::plain(t, at, slow, before.unit) });
+            let back = Tempo::plain(t, end, after.bpm, after.unit);
+            if end >= position_length(sig) {
+                let next = t + 1;
+                let taken = tempo.iter().any(|e| e.measure == next && e.position == 0.0) || fermatas.iter().any(|f| f.0 == next && f.1 == 0.0);
+                if (next as usize) < sigs.len() && !taken {
+                    put(&mut out, Tempo { measure: next, position: 0.0, ..back });
+                }
+            } else if !out.iter().any(|e| e.measure == t && e.position == end) && !fermatas.iter().any(|f| f.0 == t && f.1 == end) {
+                put(&mut out, back);
+            }
+        }
+        carried = here.last().cloned().unwrap_or(first_here);
+    }
+    // in written order, without doubles and without anything that starts inside a fermata's slow stretch
+    out.sort_by(by_place);
+    let mut kept: Vec<Tempo> = Vec::new();
+    let mut held_until: HashMap<i64, f64> = HashMap::new();
+    for e in out {
+        if kept.iter().any(|k| k.measure == e.measure && k.position == e.position && k.bpm == e.bpm) {
+            continue;
+        }
+        let held = held_until.get(&e.measure).copied();
+        if held.is_some_and(|until| e.position > 0.0 && e.position < until) {
+            continue;
+        }
+        if e.span > 0.0 && held.is_none_or(|until| until == 0.0 || e.position + e.span > until) {
+            held_until.insert(e.measure, e.position + e.span);
+        }
+        kept.push(e);
+    }
+    kept
 }
 
-pub fn walk(track: &Value, order: &[usize]) -> Vec<Slot> {
-    let ms = measures(track);
-    let (mut out, mut sig, mut sig_pair, mut bpm) = (Vec::new(), Frac::ONE, [4i64, 4i64], 120.0f64);
-    for &idx in order {
-        let m = &ms[idx];
-        if truthy(&m["signature"]) {
-            sig_pair = [m["signature"][0].as_i64().unwrap_or(4), m["signature"][1].as_i64().unwrap_or(4)];
-            sig = Frac::new(sig_pair[0], sig_pair[1]);
+/// The tempo list with every gradual change written in as steps: one step a quarter note, 64 at most, from
+/// the entry before a `linear` entry up to it.
+fn with_ramps(tempo: Vec<Tempo>, sigs: &[[i64; 2]]) -> Vec<Tempo> {
+    if tempo.len() < 2 || !tempo.iter().any(|e| e.linear) {
+        return tempo;
+    }
+    let lengths: Vec<f64> = sigs.iter().map(|s| position_length(*s)).collect();
+    let mut offsets = Vec::with_capacity(lengths.len());
+    let mut sum = 0.0;
+    for len in &lengths {
+        offsets.push(sum);
+        sum += len;
+    }
+    let spot = |e: &Tempo| usize::try_from(e.measure).ok().and_then(|m| offsets.get(m)).copied().unwrap_or(0.0) + e.position;
+    let mut sorted = tempo.clone();
+    sorted.sort_by(|a, b| spot(a).total_cmp(&spot(b)));
+    let mut taken: Vec<(i64, f64)> = sorted.iter().map(|e| (e.measure, e.position)).collect();
+    let mut steps: Vec<Tempo> = Vec::new();
+    for pair in sorted.windows(2) {
+        let (from, to) = (&pair[0], &pair[1]);
+        let (slow, fast) = (from.quarter_bpm(), to.quarter_bpm());
+        let (start, stretch) = (spot(from), spot(to) - spot(from));
+        if !to.linear || slow == fast || stretch <= 0.0 {
+            continue;
         }
-        let length = measure_length(m, sig);
-        let mut main: Option<&Value> = None;
-        for v in voices(m) {
-            if main.is_none_or(|best| voice_length(best).less(voice_length(v))) {
-                main = Some(v);
+        let count = round_half_up(stretch / 960.0).clamp(1.0, 64.0) as usize;
+        for k in 1..count {
+            let share = k as f64 / count as f64;
+            let at = start + stretch * share;
+            let m = (0..offsets.len()).find(|&m| at < offsets[m] + lengths[m]).unwrap_or(offsets.len().saturating_sub(1));
+            let position = round_half_up(at - offsets.get(m).copied().unwrap_or(0.0)).clamp(0.0, (lengths.get(m).copied().unwrap_or(1.0) - 1.0).max(0.0));
+            if !taken.contains(&(m as i64, position)) {
+                taken.push((m as i64, position));
+                steps.push(Tempo::plain(m as i64, position, round_half_up(slow + (fast - slow) * share), 4));
             }
         }
-        let (mut seconds, mut counted, mut start_bpm) = (0.0f64, Frac::ZERO, None);
-        for b in main.map(beats).unwrap_or(&[]) {
-            if let Some(t) = b["tempo"]["bpm"].as_f64().filter(|x| *x > 0.0) {
-                let unit = b["tempo"]["type"].as_f64().filter(|x| *x > 0.0).unwrap_or(4.0);
-                bpm = t * 4.0 / unit;
+    }
+    if steps.is_empty() {
+        return tempo;
+    }
+    let mut all = tempo;
+    all.extend(steps);
+    all.sort_by(by_place);
+    all
+}
+
+/// Every tempo entry of the tab the way Songsterr's player ends up using it. The tempo lives in the track's
+/// `automations`; measures count from the first entry's own measure; no entry at all means 100 bpm.
+fn tempo_list(track: &Value, sigs: &[[i64; 2]]) -> Vec<Tempo> {
+    let auto = &track["automations"];
+    let mut read: Vec<Tempo> = auto["tempo"].as_array().map(Vec::as_slice).unwrap_or(&[]).iter().filter_map(Tempo::of).collect();
+    if read.is_empty() {
+        read.push(Tempo::plain(0, 0.0, 100.0, 4));
+    }
+    let first = read[0].measure;
+    let mut list: Vec<Tempo> = Vec::new();
+    for mut e in read {
+        e.measure -= first;
+        match list.iter_mut().find(|k| k.measure == e.measure && k.position == e.position) {
+            Some(same) => *same = e,
+            None => list.push(e),
+        }
+    }
+    let list = with_fermatas(list, track, sigs);
+    if truthy(&auto["gradualTempo"]) { with_ramps(list, sigs) } else { list }
+}
+
+/// The tempo changes of one written measure: (whole notes from its start, quarter-note bpm). Two entries on
+/// one step: the first listed stands.
+fn tempo_changes(list: &[Tempo], measure: usize) -> Vec<(f64, f64)> {
+    let mut steps: Vec<(f64, f64)> = Vec::new();
+    for e in list.iter().filter(|e| e.measure == measure as i64) {
+        let step = (e.position * STEPS_PER_QUARTER / 960.0).floor();
+        if e.quarter_bpm() > 0.0 && !steps.iter().any(|s| s.0 == step) {
+            steps.push((step, e.quarter_bpm()));
+        }
+    }
+    steps.into_iter().map(|(step, bpm)| (step / (4.0 * STEPS_PER_QUARTER), bpm)).collect()
+}
+
+/// A swing ("triplet feel"): pairs of `unit` notes played long-short (or short-long) instead of evenly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Feel {
+    /// 8 for eighth-note pairs, 16 for sixteenths.
+    unit: i64,
+    /// How much of its written length the first and the second note of a pair get.
+    first: Frac,
+    second: Frac,
+    /// The plain triplet feel leaves written duplets alone.
+    plain: bool,
+}
+
+/// The swing of every written measure: a measure without its own mark keeps the one before it.
+fn feels(track: &Value) -> Vec<Option<Feel>> {
+    let mut current = None;
+    measures(track)
+        .iter()
+        .map(|m| {
+            if let Some(name) = m["tripletFeel"].as_str().filter(|n| !n.is_empty()) {
+                let unit = if name.ends_with("8th") { 8 } else { 16 };
+                let kind = name.split(|c: char| c.is_ascii_digit()).next().unwrap_or("");
+                let shares = match kind {
+                    "" => Some(((4, 3), (2, 3))),
+                    "dotted" => Some(((3, 2), (1, 2))),
+                    "scottish" => Some(((1, 2), (3, 2))),
+                    _ => None,
+                };
+                current = shares.filter(|_| name != "off").map(|(a, b)| Feel { unit, first: Frac::new(a.0, a.1), second: Frac::new(b.0, b.1), plain: kind.is_empty() });
             }
-            if start_bpm.is_none() {
-                start_bpm = Some(bpm);
-            }
-            if truthy(&b["graceNote"]) {
-                continue;
-            }
+            current
+        })
+        .collect()
+}
+
+/// The sounding length of every beat of a measure under a swing, voice by voice. A pair is left even when a
+/// note that starts in it does not fit the swing's grid, or when the pair runs past the end of the voice.
+fn swung(measure: &Value, feel: Feel) -> Vec<Vec<Frac>> {
+    let pair_of = |at: Frac| (at.n * feel.unit).div_euclid(at.d * 2);
+    let plays = |v: &Value| !truthy(&v["rest"]) && !beats(v).is_empty();
+    let lengths = |v: &Value| beats(v).iter().map(|b| Frac::of(&b["duration"])).collect::<Vec<_>>();
+    let starts = |v: &Value| {
+        let mut at = Frac::ZERO;
+        let places: Vec<Frac> = beats(v)
+            .iter()
+            .map(|b| {
+                let here = at;
+                if !truthy(&b["graceNote"]) {
+                    at = at.plus(Frac::of(&b["duration"]));
+                }
+                here
+            })
+            .collect();
+        (places, at)
+    };
+    let mut even: Vec<i64> = Vec::new();
+    for v in voices(measure).iter().filter(|v| plays(v)) {
+        for (b, at) in beats(v).iter().zip(starts(v).0) {
             let d = Frac::of(&b["duration"]);
-            seconds += d.float() * 4.0 * 60.0 / bpm;
-            counted = counted.plus(d);
+            let off_grid = (d.n * feel.unit) % d.d != 0;
+            if !truthy(&b["graceNote"]) && (off_grid || feel.plain && b["tuplet"].as_i64() == Some(2)) {
+                even.push(pair_of(at));
+            }
         }
-        if counted.less(length) {
-            seconds += length.minus(counted).float() * 4.0 * 60.0 / bpm;
+    }
+    let unit = Frac::new(1, feel.unit);
+    voices(measure)
+        .iter()
+        .map(|v| {
+            let written = lengths(v);
+            if !plays(v) {
+                return written;
+            }
+            let (places, total) = starts(v);
+            let sounding = |at: Frac| {
+                let pair = pair_of(at);
+                if even.contains(&pair) || total.less(Frac::new((pair + 1) * 2, feel.unit)) {
+                    return at;
+                }
+                let begin = Frac::new(pair * 2, feel.unit);
+                let into = at.minus(begin);
+                if unit.less(into) { begin.plus(unit.times(feel.first)).plus(into.minus(unit).times(feel.second)) } else { begin.plus(into.times(feel.first)) }
+            };
+            beats(v)
+                .iter()
+                .zip(written.iter().zip(places))
+                .map(|(b, (d, at))| if truthy(&b["graceNote"]) { *d } else { sounding(at.plus(*d)).minus(sounding(at)) })
+                .collect()
+        })
+        .collect()
+}
+
+/// Where a beat sounds in its measure: its start and its length, in whole notes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Place {
+    start: f64,
+    len: f64,
+}
+
+/// The sounding length of every beat of a measure in whole notes, voice by voice: swung where the measure
+/// swings, and never longer than the measure's time signature (`total`).
+fn sounding_lengths(measure: &Value, total: f64, feel: Option<Feel>) -> Vec<Vec<f64>> {
+    let exact: Vec<Vec<Frac>> = match feel {
+        Some(feel) => swung(measure, feel),
+        None => voices(measure).iter().map(|v| beats(v).iter().map(|b| Frac::of(&b["duration"])).collect()).collect(),
+    };
+    exact.iter().map(|v| v.iter().map(|d| d.float().min(total)).collect()).collect()
+}
+
+/// How much time the last note of a voice before measure `idx` can lend to grace notes that open the measure.
+fn room_before(track: &Value, sigs: &[[i64; 2]], feels: &[Option<Feel>], idx: usize, voice: usize) -> Option<f64> {
+    let ms = measures(track);
+    (0..idx).rev().find_map(|k| {
+        let bs = beats(voices(&ms[k]).get(voice)?);
+        let last = bs.iter().rposition(|b| !truthy(&b["graceNote"]))?;
+        let total = sigs[k][0] as f64 / sigs[k][1] as f64;
+        let lengths = sounding_lengths(&ms[k], total, feels[k]).swap_remove(voice);
+        let start: f64 = (0..last).filter(|&b| !truthy(&bs[b]["graceNote"])).map(|b| lengths[b]).sum();
+        Some(if last + 1 == bs.len() && start < total - EDGE { total - start } else { lengths[last] })
+    })
+}
+
+/// Where every beat of a measure sounds, voice by voice, the way Songsterr's player places them: beats follow
+/// each other by their own lengths (after swing), grace notes take their time from a neighbour, and the last
+/// beat is cut at the bar line. `total` is the measure's time signature in whole notes; `lent` tells how much
+/// time the note before the measure can lend, by voice.
+fn beat_places(measure: &Value, total: f64, feel: Option<Feel>, first_measure: bool, lent: &dyn Fn(usize) -> Option<f64>) -> Vec<Vec<Place>> {
+    voices(measure)
+        .iter()
+        .zip(sounding_lengths(measure, total, feel))
+        .enumerate()
+        .map(|(voice, (v, lengths))| {
+            let bs = beats(v);
+            let grace: Vec<bool> = bs.iter().map(|b| truthy(&b["graceNote"])).collect();
+            let mut out: Vec<Place> = lengths.iter().map(|len| Place { start: 0.0, len: *len }).collect();
+            let mut end = 0.0;
+            for (place, _) in out.iter_mut().zip(&grace).filter(|(_, g)| !**g) {
+                place.start = end;
+                end += place.len;
+            }
+            // groups of grace notes: (first, one past the last, played on the beat)
+            let mut groups: Vec<(usize, usize, bool)> = Vec::new();
+            let mut on_beat: Vec<bool> = bs.iter().map(|b| b["graceNote"].as_str() == Some("onBeat")).collect();
+            let mut i = 0;
+            while i < bs.len() {
+                let j = (i..bs.len()).find(|&k| !grace[k]).unwrap_or(bs.len());
+                if j > i {
+                    // before-the-beat grace notes on the very first beat of the tab have nothing to take time from
+                    if first_measure && voice == 0 && i == 0 && !on_beat[i] {
+                        on_beat[i..j].fill(true);
+                    }
+                    groups.push((i, j, on_beat[i]));
+                }
+                i = j + 1;
+            }
+            // a group is squeezed into half of the note it takes its time from, and into one grace note's length
+            for &(i, j, on) in &groups {
+                let room = match (on, i.checked_sub(1)) {
+                    (true, _) if j < bs.len() => Some(if j + 1 == bs.len() && out[j].start < total - EDGE { total - out[j].start } else { out[j].len }),
+                    (true, _) => None,
+                    (false, Some(p)) => Some(if p + 1 == bs.len() && out[p].start < total - EDGE { total - out[p].start } else { out[p].len }),
+                    (false, None) => lent(voice),
+                };
+                if let Some(room) = room {
+                    let dots = (i..j).map(|k| bs[k]["dots"].as_i64().unwrap_or(0)).max().unwrap_or(0);
+                    let share = [0.5, 0.25, 0.125][dots.clamp(0, 2) as usize];
+                    let sum: f64 = out[i..j].iter().map(|g| g.len).sum();
+                    let most = f64::min(room * (1.0 - share), sum / (j - i) as f64);
+                    if sum > most {
+                        out[i..j].iter_mut().for_each(|g| g.len = most / (j - i) as f64);
+                    }
+                }
+            }
+            // each grace note starts from the next plain note: one played on the beat pushes that note and
+            // the on-beat grace notes after it later; one played before the beat moves itself and the
+            // before-beat grace notes ahead of it earlier, and shortens the note before
+            let mut shift = vec![0.0f64; bs.len()];
+            for &(i, j, _) in &groups {
+                let after = (j < bs.len()).then_some(j);
+                for k in i..j {
+                    let len = out[k].len;
+                    out[k].start = after.map_or(total, |n| out[n].start);
+                    if on_beat[k] {
+                        (k + 1..j).take_while(|&n| on_beat[n]).for_each(|n| shift[n] += len);
+                        if let Some(n) = after {
+                            out[n].len -= len;
+                            shift[n] += len;
+                        }
+                    } else {
+                        shift[k] -= len;
+                        (i..k).rev().take_while(|&n| !on_beat[n]).for_each(|n| shift[n] -= len);
+                        if let Some(p) = i.checked_sub(1) {
+                            out[p].len = (out[p].len - len).max(0.0);
+                        }
+                    }
+                }
+            }
+            out.iter_mut().zip(&shift).for_each(|(place, by)| place.start += by);
+            for (place, g) in out.iter_mut().zip(&grace) {
+                if place.start + place.len > total + EDGE && (*g || place.start < total - EDGE) {
+                    place.len = (total - place.start).max(0.0);
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// The length of every written measure in whole notes: its time signature, whatever its beats add up to.
+/// Only a tab marked as starting with a pickup has a first measure as long as its longest voice, less the
+/// time its last note lends to grace notes that open the next measure.
+fn measure_lengths(track: &Value, sigs: &[[i64; 2]], feels: &[Option<Feel>]) -> Vec<f64> {
+    let (ms, pickup) = (measures(track), truthy(&track["anacrusis"]));
+    let total = |i: usize| sigs[i][0] as f64 / sigs[i][1] as f64;
+    let is_grace = |b: &Value| truthy(&b["graceNote"]);
+    (0..ms.len())
+        .map(|i| {
+            if !pickup || i != 0 && !truthy(&ms[i]["anacrusis"]) {
+                return total(i);
+            }
+            let mut places = beat_places(&ms[i], total(i), feels[i], i == 0, &|_| None);
+            for (v, voice) in places.iter_mut().enumerate() {
+                let bs = beats(&voices(&ms[i])[v]);
+                // the next measure where this voice plays: its opening grace notes take their time from here
+                let (Some(last), Some(k)) = (bs.iter().rposition(|b| !is_grace(b)), (i + 1..ms.len()).find(|&k| voices(&ms[k]).get(v).is_some_and(|x| !beats(x).is_empty()))) else {
+                    continue;
+                };
+                let lens = beat_places(&ms[k], total(k), feels[k], false, &|v| room_before(track, sigs, feels, k, v)).swap_remove(v);
+                let mut left = total(i) - voice[last].start;
+                for (_, grace) in beats(&voices(&ms[k])[v]).iter().zip(lens).take_while(|(b, _)| is_grace(b)).filter(|(b, _)| b["graceNote"].as_str() != Some("onBeat")) {
+                    if last + 1 == bs.len() {
+                        left -= grace.len;
+                        voice[last].len = voice[last].len.min(left);
+                    } else {
+                        voice[last].len -= grace.len;
+                    }
+                }
+            }
+            places.iter().map(|v| v.iter().map(|p| p.len).sum::<f64>()).fold(0.0, f64::max)
+        })
+        .collect()
+}
+
+/// Every played measure at the tab's own tempo. The tempo at any moment is the last change the playing has
+/// passed, so a repeat that jumps back keeps the tempo it left with; before the first change it is 100 bpm.
+pub fn walk(track: &Value, order: &[usize]) -> Vec<Slot> {
+    let sigs = signatures(track);
+    let lengths = measure_lengths(track, &sigs, &feels(track));
+    let list = tempo_list(track, &sigs);
+    // every change by where the playing meets it, in whole notes from the start
+    let (mut changes, mut begins, mut at) = (Vec::new(), Vec::with_capacity(order.len()), 0.0f64);
+    for &idx in order {
+        begins.push(at);
+        changes.extend(tempo_changes(&list, idx).into_iter().map(|(place, bpm)| (at + place, bpm)));
+        at += lengths[idx];
+    }
+    changes.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let (mut out, mut next, mut bpm) = (Vec::with_capacity(order.len()), 0usize, 100.0f64);
+    for (slot, &idx) in order.iter().enumerate() {
+        let (from, to) = (begins[slot], begins[slot] + lengths[idx]);
+        while next < changes.len() && changes[next].0 <= from {
+            bpm = changes[next].1;
+            next += 1;
         }
-        out.push(Slot { sig: sig_pair, length, seconds, bpm: start_bpm.unwrap_or(bpm) });
+        let (start_bpm, mut x, mut seconds, mut curve) = (bpm, from, 0.0f64, vec![(0.0, 0.0)]);
+        while next < changes.len() && changes[next].0 < to {
+            seconds += (changes[next].0 - x) * 240.0 / bpm;
+            x = changes[next].0;
+            bpm = changes[next].1;
+            next += 1;
+            curve.push(((x - from) / lengths[idx], seconds));
+        }
+        seconds += (to - x) * 240.0 / bpm;
+        curve.push((1.0, seconds));
+        let warp = if curve.len() == 2 || seconds <= 0.0 { Vec::new() } else { curve.iter().map(|(x, t)| (*x, t / seconds)).collect() };
+        out.push(Slot { sig: sigs[idx], length: lengths[idx], seconds, bpm: start_bpm, warp });
     }
     out
 }
@@ -281,59 +825,56 @@ struct RawNote<'a> {
 }
 
 /// Every struck or tied note with its time, length and the Songsterr beat and note it came from.
-fn raw_notes<'a>(track: &'a Value, order: &[usize], starts: &[f64], capo: i64) -> Vec<RawNote<'a>> {
+fn raw_notes<'a>(track: &'a Value, order: &[usize], slots: &[Slot], starts: &[f64], capo: i64) -> Vec<RawNote<'a>> {
     let ms = measures(track);
     let strings = track["strings"].as_i64().unwrap_or(6);
-    let (mut notes, mut sig) = (Vec::new(), Frac::ONE);
+    let (sigs, feels) = (signatures(track), feels(track));
+    let mut notes = Vec::new();
     for (slot, &idx) in order.iter().enumerate() {
         let m = &ms[idx];
-        if truthy(&m["signature"]) {
-            sig = Frac::of(&m["signature"]);
-        }
-        let length = measure_length(m, sig);
-        let (t0, t1) = (starts[slot], starts[slot + 1]);
-        for voice in voices(m) {
-            let (mut pos, mut graces): (Frac, Vec<&Value>) = (Frac::ZERO, Vec::new());
-            for beat in beats(voice) {
-                if truthy(&beat["graceNote"]) {
-                    graces.push(beat);
-                    continue;
-                }
-                let d = Frac::of(&beat["duration"]);
-                let t = t0 + (t1 - t0) * pos.over(length);
-                let dur = (t1 - t0) * d.over(length);
-                let lead = f64::min(0.06, dur * 0.25); // grace notes sit just before the beat they decorate
-                let count = graces.len();
-                let mut todo: Vec<(&Value, f64, f64, Frac)> = graces
-                    .drain(..)
-                    .enumerate()
-                    .map(|(k, g)| (g, t - lead * (count - k) as f64, lead, Frac::new(1, 64)))
-                    .collect();
-                todo.push((beat, t, dur, d));
-                for (b, bt, bdur, blen) in todo {
-                    for n in b["notes"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                        let (Some(s), Some(f)) = (n["string"].as_i64(), n["fret"].as_i64()) else {
-                            continue;
-                        };
-                        if truthy(&n["rest"]) || !n["string"].is_i64() && !n["string"].is_u64() || !(0..strings).contains(&s) {
-                            continue;
-                        }
-                        notes.push(RawNote {
-                            t: bt,
-                            dur: bdur,
-                            len: blen,
-                            s: strings - 1 - s,
-                            f: (f + capo).min(MAX_FRET + capo),
-                            slot,
-                            beat: b,
-                            note: n,
-                            bends: if truthy(&n["bend"]) { vec![(bt, bdur, &n["bend"])] } else { Vec::new() },
-                            tied: false,
-                            carry: Carry::default(),
-                        });
+        // a place in whole notes from the measure's start, as a time. A grace note before the bar line sits in
+        // the measure before, a beat past the end of an over-full measure in the one after, at their tempo.
+        let time = |place: f64| {
+            let (mut k, mut place) = (slot, place);
+            while place < 0.0 && k > 0 {
+                k -= 1;
+                place += slots[k].length;
+            }
+            while place >= slots[k].length && k + 1 < slots.len() {
+                place -= slots[k].length;
+                k += 1;
+            }
+            let length = slots[k].length;
+            // nothing sounds before the tab starts
+            starts[k] + (starts[k + 1] - starts[k]) * if length > 0.0 { slots[k].time_at(place.max(0.0) / length) } else { 0.0 }
+        };
+        let places = beat_places(m, sigs[idx][0] as f64 / sigs[idx][1] as f64, feels[idx], idx == 0, &|voice| room_before(track, &sigs, &feels, idx, voice));
+        for (voice, places) in voices(m).iter().zip(places) {
+            for (beat, place) in beats(voice).iter().zip(places) {
+                let t = time(place.start);
+                let dur = time(place.start + place.len) - t;
+                let len = if truthy(&beat["graceNote"]) { Frac::new(1, 64) } else { Frac::of(&beat["duration"]) };
+                for n in beat["notes"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                    let (Some(s), Some(f)) = (n["string"].as_i64(), n["fret"].as_i64()) else {
+                        continue;
+                    };
+                    if truthy(&n["rest"]) || !n["string"].is_i64() && !n["string"].is_u64() || !(0..strings).contains(&s) {
+                        continue;
                     }
+                    notes.push(RawNote {
+                        t,
+                        dur,
+                        len,
+                        s: strings - 1 - s,
+                        f: (f + capo).min(MAX_FRET + capo),
+                        slot,
+                        beat,
+                        note: n,
+                        bends: if truthy(&n["bend"]) { vec![(t, dur, &n["bend"])] } else { Vec::new() },
+                        tied: false,
+                        carry: Carry::default(),
+                    });
                 }
-                pos = pos.plus(d);
             }
         }
     }
@@ -598,7 +1139,7 @@ pub fn build_chart(track: &Value, starts: &[f64], name: &str) -> (Value, usize) 
     let strings = track["strings"].as_i64().unwrap_or(6).max(1) as usize;
     let capo = track["capo"].as_i64().unwrap_or(0);
     let order = unroll(track);
-    let notes = merge_ties(raw_notes(track, &order, starts, capo));
+    let notes = merge_ties(raw_notes(track, &order, &walk(track, &order), starts, capo));
     let fields = chart_notes(&notes);
 
     let (mut singles, mut chords, mut templates, mut shapes) = (Vec::new(), Vec::new(), Vec::<Value>::new(), Vec::<Value>::new());
@@ -718,9 +1259,12 @@ pub fn timeline(slots: &[Slot], starts: &[f64], sections: Vec<Value>) -> Value {
     let (mut beats, mut tempos, mut signatures): (Vec<Value>, Vec<(f64, f64)>, Vec<(f64, [i64; 2])>) = (Vec::new(), Vec::new(), Vec::new());
     for (slot, m) in slots.iter().enumerate() {
         let (t0, t1) = (starts[slot], starts[slot + 1]);
-        let count = m.sig[0].max(1);
+        // a pickup measure is shorter than its signature: it gets only the beats that start inside it
+        let unit = 1.0 / m.sig[1].max(1) as f64;
+        let count = if m.length > 0.0 { ((m.length / unit - 1e-9).ceil() as i64).clamp(1, m.sig[0].max(1)) } else { 1 };
         for k in 0..count {
-            let time = round3(t0 + (t1 - t0) * k as f64 / count as f64);
+            let place = if m.length > 0.0 { k as f64 * unit / m.length } else { 0.0 };
+            let time = round3(t0 + (t1 - t0) * m.time_at(place));
             beats.push(json!({"time": time, "measure": if k == 0 { slot as i64 + 1 } else { -1 }}));
         }
         if tempos.last().is_none_or(|last| (last.1 - m.bpm).abs() > 0.01) {
@@ -781,6 +1325,166 @@ mod tests {
 
     fn bass(measures: Value) -> Value {
         json!({"strings": 4, "tuning": [43, 38, 33, 26], "instrumentId": 33, "measures": measures})
+    }
+
+    /// A measure of `beats` with more fields of its own.
+    fn bar(beats: Value, extra: Value) -> Value {
+        let mut measure = json!({"voices": [{"beats": beats}]});
+        measure.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        measure
+    }
+
+    fn quarters() -> Value {
+        json!([beat(4, 3, 5), beat(4, 3, 5), beat(4, 3, 5), beat(4, 3, 5)])
+    }
+
+    fn eighths() -> Value {
+        Value::Array(vec![beat(8, 3, 5); 8])
+    }
+
+    fn grace(kind: &str) -> Value {
+        json!({"duration": [1, 32], "graceNote": kind, "notes": [{"string": 3, "fret": 5}]})
+    }
+
+    /// A bass tab in 4/4 with this tempo list.
+    fn tab(measures: Vec<Value>, tempo: Value) -> Value {
+        let mut track = bass(Value::Array(measures));
+        track["measures"][0]["signature"] = json!([4, 4]);
+        track["automations"] = json!({"tempo": tempo});
+        track
+    }
+
+    fn at_120() -> Value {
+        json!([{"measure": 0, "position": 0, "bpm": 120, "type": 4}])
+    }
+
+    /// The play order, the bar lines and the note times of a tab at its own tempo: what a pack with
+    /// Songsterr's sound gets.
+    fn played(track: &Value) -> (Vec<usize>, Vec<f64>, Vec<f64>) {
+        let order = unroll(track);
+        let nominal: Vec<f64> = walk(track, &order).iter().map(|s| s.seconds).collect();
+        let (starts, _) = slot_times(&nominal, &[]);
+        let (chart, _) = build_chart(track, &starts, "Bass");
+        let mut times: Vec<f64> = ["notes", "chords"].iter().flat_map(|k| chart[*k].as_array().unwrap()).map(|n| n["t"].as_f64().unwrap()).collect();
+        times.sort_by(f64::total_cmp);
+        (order, starts, times)
+    }
+
+    /// The times in the tests below are the ones Songsterr's own player gives the same tab, to the millisecond.
+    #[track_caller]
+    fn assert_times(got: &[f64], want: &[f64]) {
+        assert!(got.len() == want.len() && got.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.0015), "got {got:?}, want {want:?}");
+    }
+
+    #[test]
+    fn the_tempo_is_the_tabs_tempo_list_not_a_beats_own() {
+        let mut second = quarters();
+        second[0]["tempo"] = json!({"bpm": 60, "type": 4});
+        let track = tab(vec![bar(quarters(), json!({})), bar(second, json!({}))], json!([{"measure": 0, "position": 0, "bpm": 135, "type": 4}]));
+        assert_times(&played(&track).1, &[0.0, 1.778, 3.556]);
+        // a tab without a tempo list plays at 100
+        let mut bare = track;
+        bare.as_object_mut().unwrap().remove("automations");
+        assert_times(&played(&bare).1, &[0.0, 2.4, 4.8]);
+    }
+
+    #[test]
+    fn tempo_measures_count_from_the_first_entrys_measure() {
+        let tempo = json!([{"measure": 1, "position": 0, "bpm": 120, "type": 4}, {"measure": 2, "position": 0, "bpm": 60, "type": 4}]);
+        let track = tab(vec![bar(quarters(), json!({})); 3], tempo);
+        assert_times(&played(&track).1, &[0.0, 2.0, 6.0, 10.0]);
+    }
+
+    #[test]
+    fn tempo_counts_eighths_halves_and_dotted_notes_and_drops_the_fraction() {
+        // 200 eighths, 40 halves and 100 dotted quarters a minute; 181 eighths a minute is 90 quarters, not 90.5
+        let tempo = json!([
+            {"measure": 0, "position": 0, "bpm": 200, "type": 8},
+            {"measure": 1, "position": 0, "bpm": 40, "type": 2},
+            {"measure": 2, "position": 0, "bpm": 100, "type": 4, "dotted": true},
+            {"measure": 3, "position": 0, "bpm": 181, "type": 8},
+        ]);
+        let track = tab(vec![bar(quarters(), json!({})); 4], tempo);
+        assert_times(&played(&track).1, &[0.0, 2.4, 5.4, 7.0, 9.667]);
+    }
+
+    #[test]
+    fn a_tempo_change_inside_a_measure_moves_the_notes_after_it() {
+        let tempo = json!([{"measure": 0, "position": 0, "bpm": 120, "type": 4}, {"measure": 0, "position": 1920, "bpm": 60, "type": 4}]);
+        let track = tab(vec![bar(quarters(), json!({})); 2], tempo);
+        assert_times(&played(&track).2, &[0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn a_gradual_tempo_change_goes_in_steps_of_a_quarter_note() {
+        let tempo = json!([{"measure": 0, "position": 0, "bpm": 100, "type": 4}, {"measure": 1, "position": 0, "bpm": 140, "type": 4, "linear": true}]);
+        let mut track = tab(vec![bar(quarters(), json!({})); 2], tempo);
+        track["automations"]["gradualTempo"] = json!(true);
+        assert_times(&played(&track).2, &[0.0, 0.6, 1.145, 1.645, 2.107, 2.536, 2.964, 3.393]);
+    }
+
+    #[test]
+    fn a_fermata_slows_its_beat() {
+        let mut track = tab(vec![bar(quarters(), json!({})); 2], at_120());
+        track["automations"]["fermata"] = json!([{"measure": 0, "position": 2880, "length": 0.5}]);
+        assert_times(&played(&track).2, &[0.0, 0.5, 1.0, 1.5, 2.382, 2.882, 3.382, 3.882]);
+    }
+
+    #[test]
+    fn swing_plays_pairs_long_short_until_it_is_switched_off() {
+        let mixed = json!([beat(8, 3, 5), beat(16, 3, 5), beat(16, 3, 5), beat(4, 3, 5), beat(8, 3, 5), beat(8, 3, 5), beat(4, 3, 5)]);
+        let track = tab(vec![bar(eighths(), json!({"tripletFeel": "8th"})), bar(mixed, json!({})), bar(eighths(), json!({"tripletFeel": "off"}))], at_120());
+        let want = [0.0, 0.333, 0.5, 0.833, 1.0, 1.333, 1.5, 1.833, 2.0, 2.25, 2.375, 2.5, 3.0, 3.333, 3.5, 4.0, 4.25, 4.5, 4.75, 5.0, 5.25, 5.5, 5.75];
+        assert_times(&played(&track).2, &want);
+    }
+
+    #[test]
+    fn a_pickup_measure_is_as_long_as_its_notes_only_when_the_tab_says_so() {
+        let mut track = tab(vec![bar(json!([beat(4, 3, 5)]), json!({})), bar(quarters(), json!({}))], at_120());
+        assert_times(&played(&track).1, &[0.0, 2.0, 4.0]);
+        track["anacrusis"] = json!(true);
+        let (_, starts, times) = played(&track);
+        assert_times(&starts, &[0.0, 0.5, 2.5]);
+        assert_times(&times, &[0.0, 0.5, 1.0, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn a_note_written_past_the_bar_line_does_not_stretch_the_measure() {
+        let mut five = quarters();
+        five.as_array_mut().unwrap().push(beat(4, 1, 2));
+        let track = tab(vec![bar(five, json!({})), bar(quarters(), json!({}))], at_120());
+        let (_, starts, times) = played(&track);
+        assert_times(&starts, &[0.0, 2.0, 4.0]);
+        assert_times(&times, &[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]);
+    }
+
+    #[test]
+    fn grace_notes_take_their_time_from_the_note_they_lean_on() {
+        // on the beat: the grace note sits on the beat and pushes its note later; before the beat: it ends
+        // on the beat, also across a bar line
+        let first = json!([beat(4, 3, 5), grace("onBeat"), beat(4, 3, 5), grace("beforeBeat"), beat(4, 3, 5), beat(4, 3, 5)]);
+        let mut second = quarters();
+        second.as_array_mut().unwrap().insert(0, grace("beforeBeat"));
+        let track = tab(vec![bar(first, json!({})), bar(second, json!({}))], at_120());
+        assert_times(&played(&track).2, &[0.0, 0.5, 0.562, 0.938, 1.0, 1.5, 1.938, 2.0, 2.5, 3.0, 3.5]);
+    }
+
+    #[test]
+    fn the_tempo_follows_the_playing_through_repeats() {
+        let tempo = json!([{"measure": 0, "position": 0, "bpm": 120, "type": 4}, {"measure": 1, "position": 0, "bpm": 240, "type": 4}, {"measure": 2, "position": 0, "bpm": 60, "type": 4}]);
+        // a repeat sign with no opening sign goes back to the start
+        let track = tab(vec![bar(quarters(), json!({})), bar(quarters(), json!({"repeat": 2})), bar(quarters(), json!({}))], tempo.clone());
+        let (order, starts, _) = played(&track);
+        assert_eq!(order, vec![0, 1, 0, 1, 2]);
+        assert_times(&starts, &[0.0, 2.0, 3.0, 5.0, 6.0, 10.0]);
+        // first and second endings
+        let track = tab(
+            vec![bar(quarters(), json!({"repeatStart": true})), bar(quarters(), json!({"alternateEnding": [1], "repeat": 2})), bar(quarters(), json!({"alternateEnding": [2]}))],
+            tempo,
+        );
+        let (order, starts, _) = played(&track);
+        assert_eq!(order, vec![0, 1, 0, 2]);
+        assert_times(&starts, &[0.0, 2.0, 3.0, 5.0, 9.0]);
     }
 
     #[test]
@@ -874,8 +1578,10 @@ mod tests {
     #[test]
     fn the_grid_counts_beats_per_measure() {
         let track = bass(json!([
-            {"signature": [3, 4], "voices": [{"beats": [{"duration": [3, 4], "notes": [{"rest": true}], "tempo": {"type": 4, "bpm": 90}}]}]},
+            {"signature": [3, 4], "voices": [{"beats": [{"duration": [3, 4], "notes": [{"rest": true}]}]}]},
         ]));
+        let mut track = track;
+        track["automations"] = json!({"tempo": [{"measure": 0, "position": 0, "bpm": 90, "type": 4}]});
         let order = unroll(&track);
         let slots = walk(&track, &order);
         assert_eq!((slots[0].sig, slots[0].seconds, slots[0].bpm), ([3, 4], 2.0, 90.0));
