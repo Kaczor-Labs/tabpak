@@ -85,6 +85,8 @@ tabpak convert https://www.songsterr.com/a/wsa/metallica-master-of-puppets-tab-s
 | `src/cli.rs` | The terminal commands. |
 | `examples/shots.rs` | Draws every state of the window to PNG files without opening a window. |
 | `tests/window.rs` | Draws the window's offline states headless. |
+| `tests/golden.rs`, `tests/golden/timing.jsonl` | Made-up tabs with the times Songsterr's player gives them, and the test that holds the converter to them. |
+| `AGENTS.md` | Rules for people and coding agents who change the code. |
 | `scripts/bundle-mac.sh` | Builds `Tabpak.app`. |
 | `assets/icon.png` | The app icon. |
 
