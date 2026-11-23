@@ -22,7 +22,7 @@ Tabpak wears quickRS's own look: it draws with quickRS's `qrs-ui` crate and foll
 
 ## Status
 
-In use on macOS. Linux and Windows: not tried.
+In use on macOS. On Linux the tests pass and the terminal commands convert songs; the window is not tried there. Windows: not tried.
 
 ## Install and run
 
