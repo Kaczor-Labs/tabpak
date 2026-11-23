@@ -75,6 +75,8 @@ fn main() {
                 points: 0,
                 measures: 129,
                 notes: Vec::new(),
+                in_step: Some((3, 3)),
+                out_of_step: false,
             });
         }
         "6-many-parts" => {

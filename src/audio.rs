@@ -197,6 +197,34 @@ impl Pcm {
     }
 }
 
+/// Where a sound begins after at least 0.4 s of silence, and where the last sound ends, in seconds. Loudness is
+/// read in windows of a millisecond against the loudest one: under 0.2% is silence, and a start counts when
+/// the sound passes 2% within 30 ms. The start of the audio counts as after silence.
+pub fn sound_starts(pcm: &Pcm) -> (Vec<f64>, f64) {
+    let hop = (pcm.rate / 1000).max(1) as usize;
+    let frames = pcm.channels.iter().map(Vec::len).min().unwrap_or(0);
+    let level: Vec<f32> = (0..frames / hop)
+        .map(|w| {
+            let squares: f32 = (w * hop..(w + 1) * hop).map(|i| pcm.channels.iter().map(|c| c[i]).sum::<f32>().powi(2)).sum();
+            (squares / hop as f32).sqrt()
+        })
+        .collect();
+    let peak = level.iter().copied().fold(0.0, f32::max);
+    let at = |w: usize| (w * hop) as f64 / pcm.rate as f64;
+    let (mut starts, mut last, mut silent) = (Vec::new(), 0.0, 400);
+    for (w, &now) in level.iter().enumerate() {
+        if now < peak * 0.002 || peak == 0.0 {
+            silent += 1;
+            continue;
+        }
+        if silent >= 400 && level[w..(w + 30).min(level.len())].iter().any(|l| *l > peak * 0.02) {
+            starts.push(at(w));
+        }
+        (silent, last) = (0, at(w + 1));
+    }
+    (starts, last)
+}
+
 /// Decode an audio file. What the built-in decoders can't read (Opus, for one) goes through ffmpeg when it's
 /// installed.
 pub fn decode(path: &Path) -> Result<Pcm, String> {
@@ -271,6 +299,19 @@ pub fn read_file(path: &Path) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_starts_are_found_after_silence() {
+        // half a second of silence, a tone, a short gap the ear would not call silence, a tone, silence, a tone
+        let rate = 8000;
+        let mut mono = vec![0.0f32; 12000];
+        let tone = |mono: &mut Vec<f32>, from: usize, to: usize| (from..to).for_each(|i| mono[i] = if i % 8 < 4 { 0.5 } else { -0.5 });
+        tone(&mut mono, 4000, 4800);
+        tone(&mut mono, 5600, 6400);
+        tone(&mut mono, 10400, 11200);
+        let (starts, last) = sound_starts(&Pcm { rate, channels: vec![mono.clone(), mono] });
+        assert_eq!((starts, last), (vec![0.5, 1.3], 1.4));
+    }
 
     #[test]
     fn a_square_cover_from_a_wide_thumbnail() {

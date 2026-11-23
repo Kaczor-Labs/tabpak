@@ -818,7 +818,10 @@ impl App {
             para(p, &status, pos2(sx, foot.min.y), 13.0, th.miss, sw);
         } else if let Job::Done(done) = &self.job {
             let notes: usize = done.parts.iter().map(|(_, n)| n).sum();
-            let facts = format!("{} part{}  \u{00b7}  {} notes", done.parts.len(), if done.parts.len() == 1 { "" } else { "s" }, thousands(notes));
+            let mut facts = format!("{} part{}  \u{00b7}  {} notes", done.parts.len(), if done.parts.len() == 1 { "" } else { "s" }, thousands(notes));
+            if done.in_step.is_some_and(|(_, places)| places > 0) && !done.out_of_step {
+                facts.push_str("  \u{00b7}  in sync");
+            }
             paint::dot(p, pos2(sx + 5.0, foot.min.y + 14.0), 5.0, th.hit);
             line(p, &status, pos2(sx + 20.0, foot.min.y + 4.0), 14.0, 700, th.text, sw - 20.0);
             line(p, &facts, pos2(sx + 20.0, foot.min.y + 27.0), 12.0, 500, th.caption, sw - 20.0);
@@ -843,7 +846,7 @@ impl App {
         if let Job::Done(done) = &self.job
             && let Some(note) = done.notes.first()
         {
-            line(p, note, pos2(r.min.x, foot.max.y + 4.0), 11.0, 500, th.caption, r.width());
+            line(p, note, pos2(r.min.x, foot.max.y + 4.0), 11.0, 500, if done.out_of_step { th.miss } else { th.caption }, r.width());
         }
         if pressed && ready.is_ok() && !running {
             self.start(&ctx);

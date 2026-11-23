@@ -107,8 +107,10 @@ fn part_names(meta: &Value, picked: &[usize]) -> Vec<String> {
     picked
         .iter()
         .map(|&i| {
-            let name = field(i, "name");
-            let same: Vec<usize> = picked.iter().copied().filter(|&j| field(j, "name") == name).collect();
+            // a part the tabber left unnamed goes by its instrument
+            let named = |j: usize| Some(field(j, "name").trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| field(j, "instrument"));
+            let name = named(i);
+            let same: Vec<usize> = picked.iter().copied().filter(|&j| named(j) == name).collect();
             if same.len() < 2 {
                 return name;
             }
@@ -255,6 +257,25 @@ pub struct Done {
     pub measures: usize,
     /// Things that went another way than asked: a video that was skipped, measures without sync.
     pub notes: Vec<String>,
+    /// Songsterr sound only: of the places where a part's sound starts after silence, how many have a note
+    /// there, and how many places there are.
+    pub in_step: Option<(usize, usize)>,
+    /// The check found a part whose notes and sound are apart; `notes` starts with which.
+    pub out_of_step: bool,
+}
+
+/// How many of the places where a part's sound starts have a note of its chart there. Songsterr's sound trails
+/// its note by a few milliseconds, and leads it by up to 50 when the note slides in.
+fn notes_at(places: &[f64], times: &[f64]) -> usize {
+    let has_note = |t: f64| times.get(times.partition_point(|&n| n < t - 0.03)).is_some_and(|&n| n <= t + 0.06);
+    places.iter().filter(|&&t| has_note(t)).count()
+}
+
+/// Whether a part's notes and its sound are apart: more than a quarter of the checked places have no note (one
+/// stray click in the sound is not enough), or the last note comes after the sound has ended.
+fn apart(places: usize, hits: usize, last_note: Option<f64>, last_sound: f64) -> bool {
+    let misses = places - hits;
+    (misses >= 2 && misses * 4 > places) || last_note.is_some_and(|t| t > last_sound + 0.1)
 }
 
 struct Scratch(PathBuf);
@@ -405,7 +426,9 @@ pub fn convert(song: &Song, req: &Request, report: &mut dyn FnMut(Step, f32)) ->
         entries.push(json!({"id": id, "name": part.name, "type": part.kind.label(), "file": path, "tuning": chart["tuning"], "capo": chart["capo"]}));
         files.push((path, json_bytes(&chart)));
         done_parts.push((part.name.clone(), count));
-        part_stems.push((part.index, id, part.name.clone(), part.kind));
+        let mut times: Vec<f64> = ["notes", "chords"].iter().flat_map(|k| chart[*k].as_array().into_iter().flatten()).filter_map(|n| n["t"].as_f64()).collect();
+        times.sort_by(f64::total_cmp);
+        part_stems.push((part.index, id, part.name.clone(), part.kind, times));
     }
     let tracks: Vec<&Value> = song.parts.iter().map(|p| &p.track).collect();
     let sections = chart::section_marks(&tracks, &song.order, &starts);
@@ -413,6 +436,7 @@ pub fn convert(song: &Song, req: &Request, report: &mut dyn FnMut(Step, f32)) ->
 
     // stems: the recording alone, or each picked part, the rest of the band, and the whole mix
     let mut to_encode: Vec<(Value, Pcm)> = Vec::new();
+    let (mut in_step, mut out_of_step): (Option<(usize, usize)>, bool) = (None, false);
     if let Some(pcm) = recording {
         to_encode.push((json!({"id": "full", "file": "stems/full.ogg", "default": true}), pcm));
     } else {
@@ -425,9 +449,19 @@ pub fn convert(song: &Song, req: &Request, report: &mut dyn FnMut(Step, f32)) ->
             pcm.scale(gain);
             pcm
         });
-        for (index, id, name, kind) in &part_stems {
+        for (index, id, name, kind, times) in &part_stems {
             let Some(at) = stems.iter().position(|(track, _)| track == index) else { continue };
             let mut pcm = stems.swap_remove(at).1;
+            // the check: this part's notes against its own sound
+            let (places, last_sound) = audio::sound_starts(&pcm);
+            let places: Vec<f64> = places.iter().map(|t| t + req.offset).collect();
+            let hits = notes_at(&places, times);
+            if apart(places.len(), hits, times.last().copied(), last_sound + req.offset) {
+                let found = if places.len() > hits { format!("notes line up at {hits} of {} checked places", places.len()) } else { "its last note comes after the sound ends".to_string() };
+                notes.insert(0, format!("{name} is out of step with Songsterr's sound: {found}. Use the recording for this song."));
+                out_of_step = true;
+            }
+            in_step = Some((in_step.map_or(0, |(h, _)| h) + hits, in_step.map_or(0, |(_, p)| p) + places.len()));
             pcm.scale(gain);
             // quickRS finds a part's own stem by "bass" or "guitar" in its id and name
             let word = kind.label();
@@ -497,7 +531,7 @@ pub fn convert(song: &Song, req: &Request, report: &mut dyn FnMut(Step, f32)) ->
     let path = req.out_dir.join(name);
     feedpak::write_zip(&path, &files).map_err(|e| format!("Couldn't write the song file ({e}). Check the songs folder and try again."))?;
     report(Step::Pack, 1.0);
-    Ok(Done { path, parts: done_parts, seconds, audio: label, points: points.len(), measures: song.measures, notes })
+    Ok(Done { path, parts: done_parts, seconds, audio: label, points: points.len(), measures: song.measures, notes, in_step, out_of_step })
 }
 
 /// The folder songs go to unless the player picks another.
@@ -551,6 +585,16 @@ mod tests {
             part_names(&meta, &[0, 1, 2, 3, 4]),
             ["Electric Guitar (Distortion Guitar)", "Electric Guitar (Overdriven Guitar)", "Bass 1", "Bass 2", "Lead"]
         );
+    }
+
+    #[test]
+    fn the_sync_check_tells_in_step_from_apart() {
+        let times = [1.0, 2.0, 3.0, 4.0];
+        // the sound trails its note a little, or leads it when the note slides in; 3.2 has no note
+        assert_eq!(notes_at(&[1.008, 1.95, 3.2], &times), 2);
+        assert!(!apart(4, 3, Some(4.0), 5.0)); // one stray click in the sound
+        assert!(apart(4, 2, Some(4.0), 5.0));
+        assert!(apart(0, 0, Some(6.0), 5.0)); // the tab runs on after the sound has ended
     }
 
     #[test]
